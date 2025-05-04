@@ -1,70 +1,136 @@
 import time
 import json
+import logging
 import pandas as pd
+import numpy as np
 from kafka import KafkaProducer
+from kafka.errors import KafkaError
 
-# Initialize producer with error handling
-try:
-    producer = KafkaProducer(
-        bootstrap_servers="localhost:9092",
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        acks="all"  # Wait for all replicas to acknowledge
-    )
-except Exception as e:
-    print(f"Error connecting to Kafka: {e}")
-    exit(1)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# Load data with error handling
-try:
-    df = pd.read_parquet("data/yellow_tripdata_2025.parquet", engine="pyarrow")
-    print(f"Loaded {len(df)} records from Parquet file")
-except FileNotFoundError:
-    print("Error: Parquet file not found. Check the path.")
-    exit(1)
-except Exception as e:
-    print(f"Error loading Parquet file: {e}")
-    exit(1)
+# Configuration
+CONFIG = {
+    "kafka": {
+        "bootstrap_servers": "localhost:9092",
+        "topic": "taxi-trips",
+        "max_retries": 3,
+        "retry_delay": 1  # seconds
+    },
+    "data": {
+        "parquet_path": "/Users/aadti/nyc-taxi-fullstack/backend/data/yellow_tripdata_2025.parquet",
+        "zones_csv": "/Users/aadti/nyc-taxi-fullstack/backend/data/taxi_zone_lookup.csv",
+        "chunk_size": 5000,
+        "max_speed": 95,  # 95th percentile speed cap
+        "delay": 0.001  # seconds between chunks
+    }
+}
 
-# Process and send records
-records_sent = 0
-try:
-    for _, row in df.iterrows():
-        pickup = pd.to_datetime(row["tpep_pickup_datetime"])
-        dropoff = pd.to_datetime(row["tpep_dropoff_datetime"])
-        duration = (dropoff - pickup).total_seconds()
-        
-        # Add validation for speed calculation
-        if duration <= 0 or row["trip_distance"] < 0:
-            speed = 0
-        else:
-            speed = row["trip_distance"] / (duration / 3600)
-            # Cap unreasonable speeds (e.g., data errors showing 200+ mph)
-            if speed > 100:
-                speed = 100
-                
-        record = {
-            "timestamp": pickup.isoformat(),
-            "pickup_zone": int(row["PULocationID"]),
-            "dropoff_zone": int(row["DOLocationID"]),
-            "speed_mph": speed
-        }
-        
-        # Send to Kafka and handle errors
-        future = producer.send("taxi-trips", record)
-        records_sent += 1
-        
-        # Print progress every 100 records
-        if records_sent % 100 == 0:
-            print(f"Sent {records_sent} records to Kafka")
+def load_valid_zones():
+    """Load and return valid taxi zone IDs"""
+    try:
+        zones = pd.read_csv(CONFIG["data"]["zones_csv"])
+        return set(zones["LocationID"].astype(int))
+    except Exception as e:
+        logger.error(f"Error loading zones: {e}")
+        exit(1)
+
+def process_chunk(chunk):
+    """Process a chunk of data and return valid records"""
+    valid_zones = load_valid_zones()
+    records = []
+    
+    for _, row in chunk.iterrows():
+        try:
+            # Validate zones
+            pu_id = int(row["PULocationID"])
+            do_id = int(row["DOLocationID"])
+            if pu_id not in valid_zones or do_id not in valid_zones:
+                continue
+
+            # Calculate speed
+            pickup = pd.to_datetime(row["tpep_pickup_datetime"])
+            dropoff = pd.to_datetime(row["tpep_dropoff_datetime"])
+            duration = (dropoff - pickup).total_seconds()
             
-        time.sleep(0.01)  
-        
-except KeyboardInterrupt:
-    print("Producer stopped by user")
-except Exception as e:
-    print(f"Error in producer: {e}")
-finally:
-    # Always flush and close the producer
-    producer.flush()
-    producer.close()
-    print(f"Producer finished. Total records sent: {records_sent}")
+            if duration <= 10 or row["trip_distance"] <= 0:  # Minimum 10 sec duration
+                continue
+                
+            speed = row["trip_distance"] / (duration / 3600)
+            if speed > CONFIG["data"]["max_speed"]:
+                continue
+
+            records.append({
+                "timestamp": pickup.isoformat(),
+                "pickup_zone": pu_id,
+                "dropoff_zone": do_id,
+                "speed_mph": round(speed, 2)
+            })
+            
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Skipping invalid row: {e}")
+    
+    return records
+
+def main():
+    """Main producer execution"""
+    # Initialize Kafka producer
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers=CONFIG["kafka"]["bootstrap_servers"],
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            acks="all",
+            retries=CONFIG["kafka"]["max_retries"]
+        )
+    except KafkaError as e:
+        logger.error(f"Kafka connection failed: {e}")
+        exit(1)
+
+    # Load data
+    try:
+        df = pd.read_parquet(
+            CONFIG["data"]["parquet_path"],
+            engine="pyarrow"
+        )
+        logger.info(f"Loaded {len(df):,} records from Parquet file")
+    except Exception as e:
+        logger.error(f"Data loading failed: {e}")
+        exit(1)
+
+    # Process in chunks
+    total_sent = 0
+    chunks = np.array_split(df, len(df) // CONFIG["data"]["chunk_size"] + 1)
+    
+    try:
+        for i, chunk in enumerate(chunks):
+            records = process_chunk(chunk)
+            
+            # Send records with error handling
+            for record in records:
+                future = producer.send(CONFIG["kafka"]["topic"], record)
+                future.add_errback(
+                    lambda e: logger.error(f"Failed to send record: {e}")
+                )
+            
+            total_sent += len(records)
+            logger.info(f"Chunk {i+1}/{len(chunks)}: Sent {len(records)} records "
+                       f"(Total: {total_sent:,})")
+            
+            time.sleep(CONFIG["data"]["delay"])
+            
+    except KeyboardInterrupt:
+        logger.info("Producer stopped by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+    finally:
+        # Cleanup
+        producer.flush(timeout=30)
+        producer.close()
+        logger.info(f"Producer shutdown. Total records sent: {total_sent:,}")
+
+if __name__ == "__main__":
+    main()
