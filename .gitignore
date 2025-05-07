@@ -20,8 +20,6 @@ backend/venv/
 # Checkpoint and temp data
 chkpt/
 backend/chkpt/
-data/
-backend/data/
 
 # OS files
 .DS_Store

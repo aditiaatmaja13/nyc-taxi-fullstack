@@ -1,7 +1,7 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     from_json, col, window, avg, round as round_, 
-    when, to_timestamp, broadcast, current_timestamp
+    when, to_timestamp, broadcast
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, DoubleType
@@ -16,7 +16,8 @@ CHECKPOINT_DIR = "chkpt"
 WATERMARK_DELAY = "10 minutes"
 PROCESSING_INTERVAL = "1 minute"
 WINDOW_DURATION = "15 minutes"
-MAX_OFFSETS_PER_TRIGGER = 10000  # Process 10k records per batch
+MAX_OFFSETS_PER_TRIGGER = 10000
+DEFAULT_SPEED = 1.8  
 
 def write_to_mongo(batch_df, batch_id):
     """Optimized MongoDB writer with error handling"""
@@ -74,17 +75,18 @@ if __name__ == "__main__":
                   .option("kafka.bootstrap.servers", KAFKA_SERVERS)
                   .option("subscribe", "taxi-trips")
                   .option("startingOffsets", "earliest")
-                  .option("maxOffsetsPerTrigger", MAX_OFFSETS_PER_TRIGGER)  # Critical
+                  .option("maxOffsetsPerTrigger", MAX_OFFSETS_PER_TRIGGER)
                   .load())
 
     processed_stream = (raw_stream
                         .select(from_json(col("value").cast("string"), schema).alias("data"))
                         .select("data.*")
                         .withColumn("timestamp", to_timestamp(col("timestamp")))
-                        .filter(
-                            (col("speed_mph") > 0) & 
-                            (col("pickup_zone").isNotNull())
-                        ))
+                        # Impute low/zero speeds instead of filtering
+                        .withColumn("speed_mph", 
+                                   when((col("speed_mph") <= 0) | (col("speed_mph").isNull()), DEFAULT_SPEED)
+                                   .otherwise(col("speed_mph")))
+                        .filter(col("pickup_zone").isNotNull()))
 
     enriched_stream = (processed_stream
                        .join(broadcast_zones, 
@@ -101,11 +103,12 @@ if __name__ == "__main__":
                       col("zone_name")
                   )
                   .agg(
-                      round_(avg("speed_mph"), 2).alias("avg_speed_mph")
+                      avg("speed_mph").alias("raw_avg_speed")
                   )
+                  .withColumn("avg_speed_mph", round_(col("raw_avg_speed"), 2))
                   .withColumn("congestion_level",
-                             when(col("avg_speed_mph") < 7, "heavy")
-                             .when(col("avg_speed_mph") < 15, "moderate")
+                             when(col("raw_avg_speed") < 7, "heavy")
+                             .when(col("raw_avg_speed") < 15, "moderate")
                              .otherwise("smooth"))
                   .select(
                       col("window.start").alias("timestamp"),
@@ -124,5 +127,5 @@ if __name__ == "__main__":
              .trigger(processingTime=PROCESSING_INTERVAL)
              .start())
 
-    print("Streaming system operational with controlled batch sizes")
+    
     query.awaitTermination()
